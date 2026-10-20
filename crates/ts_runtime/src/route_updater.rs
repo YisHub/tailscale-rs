@@ -20,6 +20,9 @@ use crate::{
 
 pub struct RouteUpdater {
     default_overlay_transport: OverlayTransportId,
+    /// Overlay transport for traffic addressed to this node's own tailnet addresses, if it
+    /// shouldn't go to `default_overlay_transport`.
+    self_overlay_transport: Option<OverlayTransportId>,
     /// Map of all available DERP regions to the ID of the underlay transport that handles that
     /// region.
     derp_transport_map: DerpTransportMap,
@@ -99,11 +102,11 @@ impl RouteUpdater {
 }
 
 impl kameo::Actor for RouteUpdater {
-    type Args = (Env, OverlayTransportId);
+    type Args = (Env, OverlayTransportId, Option<OverlayTransportId>);
     type Error = Error;
 
     async fn on_start(
-        (env, default_transport): Self::Args,
+        (env, default_transport, self_transport): Self::Args,
         slf: ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
         env.subscribe::<Arc<PeerState>>(&slf).await?;
@@ -115,6 +118,7 @@ impl kameo::Actor for RouteUpdater {
 
         Ok(Self {
             default_overlay_transport: default_transport,
+            self_overlay_transport: self_transport,
             derp_transport_map: Default::default(),
             peer_state: Default::default(),
             best_paths: Default::default(),
@@ -186,16 +190,14 @@ impl Message<Arc<ts_control::StateUpdate>> for RouteUpdater {
             return;
         };
 
-        let mut out = ts_bart::Table::default();
-
         tracing::debug!(accepted_routes = ?node.accepted_routes, "populating accepted routes");
 
-        for &accepted_route in &node.accepted_routes {
-            out.insert(
-                accepted_route,
-                InboundRouteAction::ToOverlay(self.default_overlay_transport),
-            );
-        }
+        let out = self_routes(
+            &node.accepted_routes,
+            &node.tailnet_address,
+            self.default_overlay_transport,
+            self.self_overlay_transport,
+        );
 
         if let Err(e) = self
             .env
@@ -225,5 +227,77 @@ impl Message<BestPaths> for RouteUpdater {
         self.best_paths = new_bps;
 
         self.publish_peer_routes().await;
+    }
+}
+
+/// Build the inbound routing table for traffic addressed to this node.
+///
+/// Accepted routes go to `default_transport` (the netstack), except this node's own tailnet
+/// addresses, which go to `self_transport` if there is one.
+fn self_routes(
+    accepted_routes: &[ipnet::IpNet],
+    tailnet_address: &ts_control::TailnetAddress,
+    default_transport: OverlayTransportId,
+    self_transport: Option<OverlayTransportId>,
+) -> ts_bart::Table<InboundRouteAction> {
+    let mut out = ts_bart::Table::default();
+
+    for &accepted_route in accepted_routes {
+        out.insert(
+            accepted_route,
+            InboundRouteAction::ToOverlay(default_transport),
+        );
+    }
+
+    if let Some(self_transport) = self_transport {
+        for addr in [
+            core::net::IpAddr::from(tailnet_address.ipv4.addr()),
+            core::net::IpAddr::from(tailnet_address.ipv6.addr()),
+        ] {
+            out.insert(addr.into(), InboundRouteAction::ToOverlay(self_transport));
+        }
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lookup(table: &ts_bart::Table<InboundRouteAction>, ip: &str) -> Option<OverlayTransportId> {
+        match table.lookup(ip.parse().unwrap()) {
+            Some(&InboundRouteAction::ToOverlay(id)) => Some(id),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn self_routes_split() {
+        let netstack = OverlayTransportId::from(0);
+        let raw = OverlayTransportId::from(1);
+
+        let tailnet_address = ts_control::TailnetAddress {
+            ipv4: "100.64.0.1/32".parse().unwrap(),
+            ipv6: "fd7a:115c:a1e0::1/128".parse().unwrap(),
+        };
+        let accepted: Vec<ipnet::IpNet> =
+            ["100.64.0.1/32", "fd7a:115c:a1e0::1/128", "192.168.1.0/24"]
+                .iter()
+                .map(|r| r.parse().unwrap())
+                .collect();
+
+        // Without a self transport, everything goes to the netstack.
+        let table = self_routes(&accepted, &tailnet_address, netstack, None);
+        assert_eq!(lookup(&table, "100.64.0.1"), Some(netstack));
+        assert_eq!(lookup(&table, "fd7a:115c:a1e0::1"), Some(netstack));
+        assert_eq!(lookup(&table, "192.168.1.5"), Some(netstack));
+
+        // With one, only our own addresses move to it.
+        let table = self_routes(&accepted, &tailnet_address, netstack, Some(raw));
+        assert_eq!(lookup(&table, "100.64.0.1"), Some(raw));
+        assert_eq!(lookup(&table, "fd7a:115c:a1e0::1"), Some(raw));
+        assert_eq!(lookup(&table, "192.168.1.5"), Some(netstack));
+        assert_eq!(lookup(&table, "100.64.0.2"), None);
     }
 }

@@ -4,8 +4,10 @@ extern crate ts_netstack_smoltcp as netstack;
 
 use std::sync::Arc;
 
-use kameo::message::Context;
+use kameo::message::{Context, Message};
 use tokio::sync::Mutex;
+use ts_dataplane::async_tokio::{FromOverlay, Rx, ToOverlay, Tx};
+use ts_transport::OverlayTransportId;
 
 use crate::{
     control_runner::ControlRunner, dataplane::DataplaneActor, env::RegForwarded,
@@ -42,6 +44,52 @@ pub use task::{ErasedTask, Task};
 /// The runtime for a tailscale device.
 pub struct Runtime {
     env: Env,
+    packet_transport: Option<PacketTransport>,
+}
+
+/// Raw IP packet access to this node's tailnet addresses, enabled by [`Config::raw_packets`].
+///
+/// Inbound packets addressed to this node arrive on `down`. Packets sent with `sender` go
+/// through the outbound overlay router like netstack traffic.
+pub struct PacketTransport {
+    /// Send packets into the data plane.
+    pub sender: PacketSender,
+    /// Receive packets from the data plane.
+    pub down: Rx<ToOverlay>,
+}
+
+/// Cloneable handle for sending packets through a [`PacketTransport`].
+#[derive(Clone)]
+pub struct PacketSender {
+    id: OverlayTransportId,
+    up: Tx<FromOverlay>,
+}
+
+impl PacketSender {
+    /// Send an IP packet into the data plane.
+    ///
+    /// Reports whether the data plane is still running.
+    pub fn send(&self, packet: &[u8]) -> bool {
+        self.up.send((self.id, vec![packet.into()])).is_ok()
+    }
+}
+
+/// Take the [`PacketTransport`] enabled by [`Config::raw_packets`].
+///
+/// Replies `None` if raw packets are disabled or the transport was already taken.
+#[derive(Debug, Copy, Clone)]
+pub struct TakePacketTransport;
+
+impl Message<TakePacketTransport> for Runtime {
+    type Reply = Option<PacketTransport>;
+
+    async fn handle(
+        &mut self,
+        _: TakePacketTransport,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.packet_transport.take()
+    }
 }
 
 /// Configuration for starting a [`Runtime`].
@@ -53,6 +101,9 @@ pub struct Config {
     pub auth_key: Option<String>,
     /// The keys to use.
     pub keys: ts_keys::NodeState,
+    /// Deliver packets addressed to this node's tailnet addresses as raw IP packets through a
+    /// [`PacketTransport`] instead of the userspace netstack, e.g. to back an OS TUN device.
+    pub raw_packets: bool,
 }
 
 impl kameo::Actor for Runtime {
@@ -82,6 +133,19 @@ impl kameo::Actor for Runtime {
             .ask::<DataplaneActor, _>(None, dataplane::NewOverlayTransport, true)
             .await?;
 
+        let packet_transport = if config.raw_packets {
+            let (id, up, down) = env
+                .ask::<DataplaneActor, _>(None, dataplane::NewOverlayTransport, true)
+                .await?;
+
+            Some(PacketTransport {
+                sender: PacketSender { id, up },
+                down,
+            })
+        } else {
+            None
+        };
+
         disco::Disco::supervise(&slf, env.clone()).spawn().await;
 
         Multiderp::supervise(&slf, env.clone()).spawn().await;
@@ -89,9 +153,16 @@ impl kameo::Actor for Runtime {
             .spawn()
             .await;
 
-        route_updater::RouteUpdater::supervise(&slf, (env.clone(), netstack_id))
-            .spawn()
-            .await;
+        route_updater::RouteUpdater::supervise(
+            &slf,
+            (
+                env.clone(),
+                netstack_id,
+                packet_transport.as_ref().map(|t| t.sender.id),
+            ),
+        )
+        .spawn()
+        .await;
         packetfilter::PacketfilterUpdater::supervise(&slf, env.clone())
             .spawn()
             .await;
@@ -148,7 +219,10 @@ impl kameo::Actor for Runtime {
         env.wait::<NetstackActor>(None).await?;
         env.wait::<PeerTracker>(None).await?;
 
-        Ok(Self { env })
+        Ok(Self {
+            env,
+            packet_transport,
+        })
     }
 }
 

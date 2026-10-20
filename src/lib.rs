@@ -122,6 +122,7 @@
 //! [`axum` HTTP server]: https://docs.rs/axum/latest/axum/
 
 use std::{
+    collections::VecDeque,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     time::Duration,
 };
@@ -206,6 +207,7 @@ impl Device {
             control_config: config.into(),
             auth_key,
             keys,
+            raw_packets: config.raw_packets,
         });
 
         rt.wait_for_startup_result()
@@ -326,6 +328,23 @@ impl Device {
             .map_err(Into::into)
     }
 
+    /// Take the raw IP packet handle for this device's tailnet addresses.
+    ///
+    /// Returns `None` if [`Config::raw_packets`] is not set, or if the handle has already been
+    /// taken.
+    pub async fn take_raw_packets(&self) -> Result<Option<RawPackets>, Error> {
+        let transport = self
+            .runtime
+            .ask(ts_runtime::TakePacketTransport)
+            .await
+            .map_err(ts_runtime::Error::from)?;
+
+        Ok(transport.map(|inner| RawPackets {
+            inner,
+            pending: VecDeque::new(),
+        }))
+    }
+
     /// Attempt to gracefully shut down this device's runtime.
     ///
     /// Reports whether the device was fully shut down before the timeout. It is still shut
@@ -356,6 +375,75 @@ impl Device {
                 true
             }
         }
+    }
+}
+
+/// Raw IPv4/IPv6 packet access to this device's tailnet addresses.
+///
+/// Obtained from [`Device::take_raw_packets`] when [`Config::raw_packets`] is set. Packets from
+/// tailnet peers addressed to this node, after the tailnet's packet filter, are delivered by
+/// [`recv`](RawPackets::recv) instead of to the userspace netstack. Packets passed to
+/// [`send`](RawPackets::send) are routed to tailnet peers exactly like netstack traffic.
+///
+/// Inbound packets are queued without bound until received, so keep calling `recv` while the
+/// device is running.
+pub struct RawPackets {
+    inner: ts_runtime::PacketTransport,
+    pending: VecDeque<Vec<u8>>,
+}
+
+impl RawPackets {
+    /// Send an IP packet to the tailnet.
+    ///
+    /// Packets without a route to a tailnet peer are dropped.
+    pub fn send(&self, packet: &[u8]) -> Result<(), Error> {
+        send_raw(&self.inner.sender, packet)
+    }
+
+    /// Get a cloneable handle for sending packets, e.g. from another task while this one waits
+    /// in [`recv`](RawPackets::recv).
+    pub fn sender(&self) -> RawPacketSender {
+        RawPacketSender(self.inner.sender.clone())
+    }
+
+    /// Receive the next IP packet from the tailnet addressed to this node.
+    ///
+    /// This method is cancel-safe.
+    pub async fn recv(&mut self) -> Result<Vec<u8>, Error> {
+        loop {
+            if let Some(packet) = self.pending.pop_front() {
+                return Ok(packet);
+            }
+
+            let packets = self
+                .inner
+                .down
+                .recv()
+                .await
+                .ok_or(Error::Internal(InternalErrorKind::InternalChannelClosed))?;
+            self.pending.extend(packets.iter().map(|p| p.to_vec()));
+        }
+    }
+}
+
+/// Cloneable handle for sending packets through [`RawPackets`].
+#[derive(Clone)]
+pub struct RawPacketSender(ts_runtime::PacketSender);
+
+impl RawPacketSender {
+    /// Send an IP packet to the tailnet.
+    ///
+    /// Packets without a route to a tailnet peer are dropped.
+    pub fn send(&self, packet: &[u8]) -> Result<(), Error> {
+        send_raw(&self.0, packet)
+    }
+}
+
+fn send_raw(sender: &ts_runtime::PacketSender, packet: &[u8]) -> Result<(), Error> {
+    if sender.send(packet) {
+        Ok(())
+    } else {
+        Err(Error::Internal(InternalErrorKind::InternalChannelClosed))
     }
 }
 

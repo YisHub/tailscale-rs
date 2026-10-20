@@ -8,6 +8,9 @@ Put changes for the upcoming release here!
 
 - Fixed (Rust API): return an error from `is_authorized` when the user's auth key is rejected by
   the control server. Resolves crashes and panics that would otherwise occur in this case.
+- Added (Rust API): `Config::raw_packets` and `Device::take_raw_packets`, which exchange raw IP
+  packets for the device's own tailnet addresses instead of using the userspace netstack, e.g. to
+  back an OS TUN/VPN interface.
 - Fixed (ts_dataplane): an overlay or underlay transport that dropped its receiver no longer
   panics the data plane.
 

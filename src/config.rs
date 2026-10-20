@@ -41,6 +41,14 @@ pub struct Config {
     ///
     /// [KB article on ephemeral nodes]: https://tailscale.com/docs/features/ephemeral-nodes
     pub ephemeral: bool,
+
+    /// Exchange raw IP packets for this node's tailnet addresses instead of terminating them in
+    /// the userspace netstack, e.g. to back an OS TUN or VPN interface.
+    ///
+    /// Take the packet handle with [`Device::take_raw_packets`](crate::Device::take_raw_packets).
+    /// Socket methods such as [`Device::udp_bind`](crate::Device::udp_bind) don't receive traffic
+    /// in this mode. Until the handle is taken, inbound packets are queued without bound.
+    pub raw_packets: bool,
 }
 
 impl Config {
@@ -131,6 +139,7 @@ impl Default for Config {
             requested_hostname: None,
             requested_tags: vec![],
             ephemeral: false,
+            raw_packets: false,
         }
     }
 }

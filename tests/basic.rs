@@ -1,7 +1,8 @@
 //! Basic `tailscale` tests.
 
 use std::{
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
     time::Duration,
 };
 
@@ -12,6 +13,7 @@ use tokio::{
 };
 
 const NET_TIMEOUT: Duration = Duration::from_secs(1);
+const RESEND_INTERVAL: Duration = Duration::from_millis(250);
 
 #[tracing_test::traced_test]
 #[tokio::test]
@@ -194,6 +196,138 @@ async fn test_udp_unidir(tx: &UdpSocket, rx: &UdpSocket) {
 
     assert_eq!(who, tx.local_addr());
     assert_eq!(msg.as_ref(), b"hello");
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn raw_packets_udp4() {
+    if !ts_test_util::run_net_tests() {
+        tracing::warn!("net tests disabled");
+        return;
+    }
+
+    // Two devices have to find each other through the tailnet, which takes longer than the
+    // single-device tests.
+    timeout(Duration::from_secs(30), async move {
+        let dev = make_ts_device().await.unwrap();
+        let raw_dev = Device::new(
+            &Config {
+                raw_packets: true,
+                ..Default::default()
+            },
+            Some(ts_test_util::auth_key().unwrap()),
+        )
+        .await
+        .unwrap();
+        let mut raw = raw_dev.take_raw_packets().await.unwrap().unwrap();
+        assert!(raw_dev.take_raw_packets().await.unwrap().is_none());
+
+        let ip = dev.ipv4_addr().await.unwrap();
+        let raw_ip = raw_dev.ipv4_addr().await.unwrap();
+        let udp = Arc::new(dev.udp_bind((ip, 1234).into()).await.unwrap());
+
+        // Packets sent while the tunnel between the two devices is coming up get dropped, so
+        // keep resending until one arrives. Receives aren't wrapped in a timeout: the outer one
+        // bounds the test.
+
+        // Netstack -> raw: the packet arrives unmodified, addressed to the raw device.
+        let sender = tokio::spawn({
+            let udp = udp.clone();
+            async move {
+                loop {
+                    udp.send_to((raw_ip, 5678).into(), b"hello").await.unwrap();
+                    tokio::time::sleep(RESEND_INTERVAL).await;
+                }
+            }
+        });
+        let packet = raw.recv().await.unwrap();
+        sender.abort();
+        assert_eq!(
+            parse_udp4(&packet),
+            Some((ip, 1234, raw_ip, 5678, &b"hello"[..]))
+        );
+
+        // Raw -> netstack.
+        let sender = tokio::spawn({
+            let raw = raw.sender();
+            async move {
+                loop {
+                    raw.send(&udp4_packet(raw_ip, 5678, ip, 1234, b"world"))
+                        .unwrap();
+                    tokio::time::sleep(RESEND_INTERVAL).await;
+                }
+            }
+        });
+        let (who, msg) = udp.recv_from_bytes().await.unwrap();
+        sender.abort();
+        assert_eq!(who, (raw_ip, 5678).into());
+        assert_eq!(msg.as_ref(), b"world");
+    })
+    .await
+    .unwrap();
+}
+
+/// Build an IPv4/UDP packet.
+fn udp4_packet(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, dport: u16, payload: &[u8]) -> Vec<u8> {
+    let udp_len = 8 + payload.len() as u16;
+    let total_len = 20 + udp_len;
+
+    let mut packet = vec![0x45, 0, 0, 0, 0, 0, 0, 0, 64, 17, 0, 0];
+    packet[2..4].copy_from_slice(&total_len.to_be_bytes());
+    packet.extend_from_slice(&src.octets());
+    packet.extend_from_slice(&dst.octets());
+    let ip_checksum = checksum(&packet);
+    packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
+
+    let mut udp = vec![];
+    udp.extend_from_slice(&sport.to_be_bytes());
+    udp.extend_from_slice(&dport.to_be_bytes());
+    udp.extend_from_slice(&udp_len.to_be_bytes());
+    udp.extend_from_slice(&[0, 0]);
+    udp.extend_from_slice(payload);
+
+    let mut pseudo = vec![];
+    pseudo.extend_from_slice(&src.octets());
+    pseudo.extend_from_slice(&dst.octets());
+    pseudo.extend_from_slice(&[0, 17]);
+    pseudo.extend_from_slice(&udp_len.to_be_bytes());
+    pseudo.extend_from_slice(&udp);
+    let udp_checksum = match checksum(&pseudo) {
+        0 => 0xffff,
+        c => c,
+    };
+    udp[6..8].copy_from_slice(&udp_checksum.to_be_bytes());
+
+    packet.extend_from_slice(&udp);
+    packet
+}
+
+/// Parse an IPv4/UDP packet into (src, sport, dst, dport, payload).
+fn parse_udp4(packet: &[u8]) -> Option<(Ipv4Addr, u16, Ipv4Addr, u16, &[u8])> {
+    let ihl = usize::from(*packet.first()? & 0x0f) * 4;
+    if packet[0] >> 4 != 4 || *packet.get(9)? != 17 {
+        return None;
+    }
+
+    let src = Ipv4Addr::from(<[u8; 4]>::try_from(packet.get(12..16)?).ok()?);
+    let dst = Ipv4Addr::from(<[u8; 4]>::try_from(packet.get(16..20)?).ok()?);
+    let udp = packet.get(ihl..)?;
+    let sport = u16::from_be_bytes([*udp.first()?, *udp.get(1)?]);
+    let dport = u16::from_be_bytes([*udp.get(2)?, *udp.get(3)?]);
+
+    Some((src, sport, dst, dport, udp.get(8..)?))
+}
+
+/// The Internet checksum (RFC 1071).
+fn checksum(data: &[u8]) -> u16 {
+    let mut sum = data
+        .chunks(2)
+        .map(|c| u32::from(u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)])))
+        .sum::<u32>();
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
 }
 
 async fn make_ts_device() -> Result<Device, Error> {
