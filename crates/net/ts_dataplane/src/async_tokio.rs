@@ -351,11 +351,11 @@ impl DataPlane {
         }
 
         if let Some(to_peers) = to_peers {
-            write_to_underlay(&core, to_peers).await;
+            write_to_underlay(&mut core, to_peers).await;
         }
 
         if let Some(to_local) = to_local {
-            write_to_overlay(&core, to_local).await;
+            write_to_overlay(&mut core, to_local).await;
         }
     }
 
@@ -370,21 +370,34 @@ impl DataPlane {
     }
 }
 
-async fn write_to_overlay(slf: &CoreState, packets: HashMap<OverlayTransportId, Vec<PacketMut>>) {
+async fn write_to_overlay(
+    slf: &mut CoreState,
+    packets: HashMap<OverlayTransportId, Vec<PacketMut>>,
+) {
     for (id, packets) in packets {
         if let Some(queue) = slf.overlay_transports.get(&id) {
             tracing::trace!(overlay_id = ?id, n_packets = packets.len(), "overlay packets");
-            queue.send(packets).unwrap();
+
+            if queue.send(packets).is_err() {
+                // The overlay dropped its receiver, so it will never read again. Forget it, so
+                // later packets routed to it are dropped instead of taking the data plane down.
+                tracing::warn!(overlay_id = ?id, "overlay transport closed, dropping its packets");
+                slf.overlay_transports.remove(&id);
+            }
         }
     }
 }
 
-async fn write_to_underlay(slf: &CoreState, packets: underlay_router::outbound::Result) {
+async fn write_to_underlay(slf: &mut CoreState, packets: underlay_router::outbound::Result) {
     for ((tid, endpoint), packets) in packets {
         tracing::trace!(underlay_id = ?tid, ?endpoint, n_packets = packets.len(), "underlay data packets");
 
-        if let Some(queue) = slf.underlay_transports.get(&tid) {
-            queue.send((endpoint, packets)).unwrap();
+        if let Some(queue) = slf.underlay_transports.get(&tid)
+            && queue.send((endpoint, packets)).is_err()
+        {
+            // Same as for overlays: a transport that dropped its receiver is gone for good.
+            tracing::warn!(underlay_id = ?tid, "underlay transport closed, dropping its packets");
+            slf.underlay_transports.remove(&tid);
         }
     }
 }
@@ -393,5 +406,51 @@ async fn option_sleep_until(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => core::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn closed_overlay_transport_is_dropped() {
+        let (dp, _disco, _stun, _peers) = DataPlane::new(NodeKeyPair::random());
+
+        let (open_id, _up, mut open_rx) = dp.new_overlay_transport().await;
+        let (closed_id, _up, closed_rx) = dp.new_overlay_transport().await;
+        drop(closed_rx);
+
+        let mut core = dp.core_state.lock().await;
+        let packets = HashMap::from([
+            (open_id, vec![PacketMut::from(&[1, 2, 3])]),
+            (closed_id, vec![PacketMut::from(&[4, 5, 6])]),
+        ]);
+        write_to_overlay(&mut core, packets).await;
+
+        assert!(core.overlay_transports.contains_key(&open_id));
+        assert!(!core.overlay_transports.contains_key(&closed_id));
+        assert_eq!(open_rx.try_recv().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn closed_underlay_transport_is_dropped() {
+        let (dp, _disco, _stun, _peers) = DataPlane::new(NodeKeyPair::random());
+
+        let (open_id, mut open_rx, _down) = dp.new_underlay_transport().await;
+        let (closed_id, closed_rx, _down) = dp.new_underlay_transport().await;
+        drop(closed_rx);
+
+        let mut core = dp.core_state.lock().await;
+        let ep = DynEndpoint::udp(([127, 0, 0, 1], 41641).into());
+        let packets = HashMap::from([
+            ((open_id, ep.clone()), vec![PacketMut::from(&[1, 2, 3])]),
+            ((closed_id, ep), vec![PacketMut::from(&[4, 5, 6])]),
+        ]);
+        write_to_underlay(&mut core, packets).await;
+
+        assert!(core.underlay_transports.contains_key(&open_id));
+        assert!(!core.underlay_transports.contains_key(&closed_id));
+        assert_eq!(open_rx.try_recv().unwrap().1.len(), 1);
     }
 }
